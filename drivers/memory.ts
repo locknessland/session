@@ -57,10 +57,22 @@ export class MemorySessionDriver implements SessionDriver {
         this.sessions.delete(sessionId)
     }
 
-    async regenerate(oldId: string, newId: string): Promise<void> {
+    async regenerate(
+        oldId: string,
+        newId: string,
+        lifetime: number,
+    ): Promise<void> {
         const session = this.sessions.get(oldId)
         if (session) {
-            this.sessions.set(newId, session)
+            // Recompute the expiry from the passed lifetime rather than copying
+            // the old record's `expires` verbatim (Architecture A-M1): a
+            // regenerated session gets a FRESH lifetime — the same "now +
+            // lifetime" a `write()` applies on every other driver — not the
+            // remaining lifetime left on the old id.
+            this.sessions.set(newId, {
+                data: session.data,
+                expires: Date.now() + lifetime * 1000,
+            })
             this.sessions.delete(oldId)
         }
     }

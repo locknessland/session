@@ -80,7 +80,15 @@ export class SessionStore implements Session {
 
     async regenerate(): Promise<void> {
         const newId = generateSessionId()
-        await this.driver.regenerate(this.sessionId, newId)
+        // `config.lifetime` is the single source of "how long a session lives"
+        // (plan §5 row 1) — the same value `write()` receives — so a regenerated
+        // session is given a fresh lifetime rather than inheriting the old
+        // record's remaining TTL or a per-driver default.
+        await this.driver.regenerate(
+            this.sessionId,
+            newId,
+            this.config.lifetime,
+        )
         this.sessionId = newId
         this.dirty = true
     }
@@ -105,6 +113,44 @@ export class SessionStore implements Session {
 
     isDirty(): boolean {
         return this.dirty
+    }
+
+    /**
+     * Set the opaque subject the session belongs to (#147).
+     *
+     * Delegates to the optional `driver.setSubject?` — only the cookie driver
+     * embeds a subject; on the other drivers this is a no-op. Stringified so the
+     * opaque token matches the eviction key. See {@link Session.setSubject}.
+     *
+     * @param id - The authenticated principal's id.
+     */
+    setSubject(id: string | number): void {
+        this.driver.setSubject?.(String(id))
+    }
+
+    /**
+     * Evict every session of a subject (#147).
+     *
+     * Delegates to the optional `driver.revokeUser?` — only the cookie driver
+     * records an eviction epoch; on the other drivers this is a no-op. Stringified
+     * so the eviction key matches the embedded subject. See
+     * {@link Session.revokeUser}.
+     *
+     * @param id - The authenticated principal's id to evict.
+     * @throws When the backing store write fails (fail-closed).
+     */
+    async revokeUser(id: string | number): Promise<void> {
+        // Fail LOUD when the active driver cannot evict per-user (only the cookie
+        // driver records an eviction epoch). A silent no-op here would let a
+        // caller believe "log out everywhere" happened when it did nothing on a
+        // memory/deno-kv/redis driver (#147 review). Server-side per-user eviction
+        // on those drivers is a separate mechanism (delete the record) — not this.
+        if (!this.driver.revokeUser) {
+            throw new Error(
+                'per-user session eviction requires the cookie driver with revocation enabled',
+            )
+        }
+        await this.driver.revokeUser(String(id))
     }
 
     /**

@@ -27,6 +27,10 @@ Deno.test('sessionMiddleware - attaches session to context', async () => {
 })
 
 Deno.test('sessionMiddleware - persists data across requests', async () => {
+    // #142 / #138: this test used to request only `/set` and assert a status
+    // code, so it stayed green through the whole life of a memory driver that
+    // never persisted. It now makes the second request, carrying the session
+    // cookie, and asserts the value written on request 1 is read on request 2.
     configureSession({
         driver: 'memory',
         secret: 'test-secret-persist',
@@ -37,22 +41,29 @@ Deno.test('sessionMiddleware - persists data across requests', async () => {
     app.use('*', sessionMiddleware({ driver: 'memory' }))
 
     app.get('/set', (c) => {
-        const session = getSession(c)
-        session.set('counter', 1)
+        getSession(c).set('counter', 1)
         return c.text('Set')
     })
 
     app.get('/get', (c) => {
-        const session = getSession(c)
-        const counter = session.get<number>('counter')
-        return c.text(`Counter: ${counter}`)
+        return c.text(String(getSession(c).get<number>('counter') ?? 'MISSING'))
     })
 
     const res1 = await app.request('/set')
     assertEquals(res1.status, 200)
+    const cookie = res1.headers.get('set-cookie')?.split(';')[0]
+    assertEquals(
+        typeof cookie,
+        'string',
+        'the session id was issued as a cookie',
+    )
 
-    // Note: In real scenario, session ID would be passed via cookie
-    // This is a simplified test showing middleware integration
+    const res2 = await app.request('/get', { headers: { cookie: cookie! } })
+    assertEquals(
+        await res2.text(),
+        '1',
+        'the value written on request 1 was read on request 2',
+    )
 })
 
 Deno.test('sessionMiddleware - flash messages work', async () => {

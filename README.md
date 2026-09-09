@@ -3,6 +3,37 @@
 Multi-driver session management system with support for Cookie, Memory, Deno KV,
 and **Redis** storage.
 
+## The application key
+
+`APP_KEY` is **key material**, not a password. It must be `base64:` followed by
+exactly 32 random bytes, base64-encoded — the shape `lockness init` generates:
+
+```
+APP_KEY=base64:xQ8vN2mK...44 characters...=
+```
+
+Anything else is refused at boot. There is no fallback, no default and no
+unencrypted mode: a cookie-driver application with no usable key **does not
+start** in production, and outside production it runs on a random key generated
+for that process only (so sessions do not survive a restart).
+
+### If you have been running on a placeholder key — rotate
+
+Earlier versions fell back to a key committed to this repository, and the cookie
+driver silently skipped encryption entirely when the key was empty — which was
+the package default. **Every session cookie ever issued under either condition
+is forgeable by anyone**, and stays forgeable until `APP_KEY` is rotated.
+Upgrading does not undo cookies already issued.
+
+Generate a new one and deploy it:
+
+```bash
+deno eval "const b=crypto.getRandomValues(new Uint8Array(32));let s='';for(const x of b)s+=String.fromCharCode(x);console.log('base64:'+btoa(s))"
+```
+
+Every user is signed out once when the key changes. That is the intended cost:
+the alternative is honouring cookies issued under a key the whole internet has.
+
 ## Features
 
 - 🔐 **Encrypted Cookie Sessions** - AES-GCM encryption for secure client-side
@@ -70,7 +101,7 @@ import { configureSession } from '@lockness/session'
 
 configureSession({
     driver: 'cookie', // or 'memory', 'deno-kv', 'redis'
-    secret: 'your-32-character-secret-key!',
+    secret: Deno.env.get('APP_KEY')!,
     lifetime: 7200, // 2 hours
     cookieName: 'app_session',
     secure: true, // HTTPS only
@@ -142,7 +173,7 @@ Stores encrypted session data in a client-side cookie using AES-GCM encryption.
 ```typescript
 configureSession({
     driver: 'cookie',
-    secret: 'your-secret-key-min-32-chars!!!',
+    secret: Deno.env.get('APP_KEY')!,
     cookieName: 'app_session',
     lifetime: 7200,
 })
@@ -166,7 +197,7 @@ Stores sessions in server memory. **For development/testing only.**
 ```typescript
 configureSession({
     driver: 'memory',
-    secret: 'test-secret',
+    secret: Deno.env.get('APP_KEY')!,
     cookieName: 'dev_session',
 })
 ```
@@ -190,7 +221,7 @@ Stores sessions in Deno's built-in key-value database.
 ```typescript
 configureSession({
     driver: 'deno-kv',
-    secret: 'your-secret',
+    secret: Deno.env.get('APP_KEY')!,
     kvPath: './data/kv', // Optional path
     cookieName: 'kv_session',
     lifetime: 7200,
@@ -217,7 +248,7 @@ Stores sessions in Redis for production scalability.
 ```typescript
 configureSession({
     driver: 'redis',
-    secret: 'your-secret',
+    secret: Deno.env.get('APP_KEY')!,
     cookieName: 'redis_session',
     lifetime: 7200,
     redis: {
@@ -349,7 +380,7 @@ app.get('/profile', (c) => {
 
 ```typescript
 // ❌ Bad
-secret: 'secret'
+secret: Deno.env.get('APP_KEY')!
 
 // ✅ Good (min 32 characters)
 secret: crypto.randomUUID() + crypto.randomUUID()

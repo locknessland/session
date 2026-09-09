@@ -56,7 +56,7 @@ export interface RedisConfig {
  *   driver: 'deno-kv',
  *   cookieName: 'app_session',
  *   lifetime: 3600,
- *   secret: 'your-32-char-secret-key-here!!!',
+ *   secret: Deno.env.get('APP_KEY'),
  *   path: '/',
  *   secure: true,
  *   httpOnly: true,
@@ -80,16 +80,44 @@ export interface SessionConfig {
      */
     cookieName: string
     /**
-     * Session lifetime in seconds.
+     * Idle session lifetime in seconds — the window of inactivity after which a
+     * session expires. Refreshed on every write.
      * @default 7200 (2 hours)
      */
     lifetime: number
     /**
-     * Secret key for signing/encrypting cookies.
-     * Should be at least 32 characters for AES-256-GCM encryption.
-     * @required
+     * Absolute session lifetime in seconds — the hard ceiling measured from first
+     * issuance, **never** refreshed by activity. When set (a positive number),
+     * the cookie driver refuses a session once `now - iat` exceeds it, no matter
+     * how often it was re-sealed. Leave **undefined** to disable the cap
+     * (`0`/negative is a configuration error, not "off"). Recommended when
+     * enabled: `604800` (7 days). Only the cookie driver enforces it today.
+     * @default undefined (no absolute cap)
      */
-    secret: string
+    absoluteLifetime?: number
+    /**
+     * Enable per-session revocation on the cookie driver: logout and id rotation
+     * add the session's nonce to a Deno-KV revocation set, so a captured copy of
+     * a revoked cookie can no longer authenticate. **Requires
+     * {@link SessionConfig.absoluteLifetime}** (it bounds each revocation entry's
+     * retention); enabling it without the cap is refused at boot. With it off the
+     * cookie driver holds no server-side state.
+     * @default false
+     */
+    revocation?: boolean
+    /**
+     * The application key, as `base64:` followed by 32 random bytes in base64 —
+     * the shape {@link generateAppKey} emits and the only one accepted.
+     *
+     * Optional here because the memory, Deno KV and Redis drivers never encrypt
+     * anything; the cookie they set carries only a session id. The **cookie**
+     * driver requires it and refuses to construct without one. There is no
+     * unencrypted mode: a missing key is a configuration error, never a silent
+     * downgrade to base64.
+     *
+     * Never a literal in source. See `secret.ts`.
+     */
+    secret?: string
     /**
      * Cookie path attribute.
      * @default '/'
@@ -169,11 +197,21 @@ export interface SessionDriver {
     destroy(sessionId: string): Promise<void>
     /**
      * Regenerate session ID (transfer data to new ID).
-     * Used for security purposes after authentication.
+     *
+     * Used for session-fixation protection after authentication: the data is
+     * carried to `newId` and the record at `oldId` is destroyed. On the
+     * server-side drivers the move is atomic — the new key is written and the
+     * old one deleted as one indivisible operation.
+     *
      * @param oldId - The current session identifier
      * @param newId - The new session identifier
+     * @param lifetime - Session lifetime in seconds. The regenerated session is
+     *   given a **fresh** lifetime — the same value a `write()` for this session
+     *   would receive — never the remaining lifetime of the old record and never
+     *   a per-driver default. The single source is `SessionConfig.lifetime`,
+     *   threaded here by {@link Session.regenerate}'s store implementation.
      */
-    regenerate(oldId: string, newId: string): Promise<void>
+    regenerate(oldId: string, newId: string, lifetime: number): Promise<void>
     /**
      * Garbage collection - remove expired sessions.
      * Optional: only implement for drivers that need manual cleanup.
@@ -184,6 +222,28 @@ export interface SessionDriver {
      * Optional: only implement for drivers with persistent connections.
      */
     close?(): Promise<void>
+    /**
+     * Stash the opaque subject token to embed on the next write (#147).
+     *
+     * **Optional and cookie-only** — mirroring `gc?`/`close?`. Only the cookie
+     * driver carries a subject inside its sealed payload; the server-side drivers
+     * hold no subject and do not implement this. The session layer never
+     * interprets `sub`.
+     *
+     * @param sub - The opaque subject token (the authenticated principal's id).
+     */
+    setSubject?(sub: string): void
+    /**
+     * Evict every session of a subject by recording its eviction epoch (#147).
+     *
+     * **Optional and cookie-only.** The stateless cookie driver cannot enumerate
+     * a subject's sessions, so it uses an eviction epoch; the server-side drivers
+     * delete their records instead and do not implement this (plan §9 R3).
+     *
+     * @param sub - The opaque subject token to evict.
+     * @throws When the backing store write fails (fail-closed).
+     */
+    revokeUser?(sub: string): Promise<void>
 }
 
 /**
@@ -278,4 +338,28 @@ export interface Session {
      * @returns True if any data has been changed
      */
     isDirty(): boolean
+    /**
+     * Set the opaque subject the session belongs to (#147).
+     *
+     * **Optional** — honoured only by the cookie driver (the sole driver whose
+     * sealed payload carries a subject); a no-op on the server-side drivers. The
+     * auth guard calls it after every `regenerate()` so the per-user eviction
+     * check keys on the same identity authentication does (`sub ===
+     * d[sessionKeyName]`). The id is stringified for the opaque token.
+     *
+     * @param id - The authenticated principal's id.
+     */
+    setSubject?(id: string | number): void
+    /**
+     * Evict every session of a subject (#147) — "log out everywhere / others".
+     *
+     * **Optional** — honoured only by the cookie driver; a no-op on the
+     * server-side drivers (they delete their records instead, plan §9 R3). Records
+     * the subject's eviction epoch so every session issued before now is refused.
+     * Reached only through the auth guard, scoped to the authenticated subject.
+     *
+     * @param id - The authenticated principal's id to evict.
+     * @throws When the backing store write fails (fail-closed).
+     */
+    revokeUser?(id: string | number): Promise<void>
 }
