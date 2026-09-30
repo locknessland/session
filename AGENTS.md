@@ -124,6 +124,14 @@ Anything not listed is internal and free to change.
 - `packages/session/tests/user_revocation.test.ts`
 - `packages/session/tests/wire_format.test.ts`
 
+1 mutation battery — **`deno test` does not run these.** Each is an executable
+that mutates a source file and re-runs the suites that should notice. Run them
+with `deno task mutate` (all of them, one at a time) or
+`deno task mutate <name>` (one); nightly CI runs the full sweep. See
+[testing.md](../../docs/testing.md#mutation-batteries).
+
+- `packages/session/tests/mutations/revocation_guard_389.ts`
+
 <!-- /generated:tests -->
 
 ## Before you call it done
@@ -133,8 +141,7 @@ Anything not listed is internal and free to change.
 The framework-wide gate, from the repository root:
 
 ```bash
-deno fmt && deno lint && deno check && deno task test
-deno task deps:analyze     # cycles, declaration drift, tier policy
+deno task gate             # the full gate, as the pre-push hook runs it
 deno task agents:brief     # refresh this file's generated blocks
 ```
 

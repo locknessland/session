@@ -11,9 +11,13 @@
  * classification of a value into a rejection class is still exercised through
  * `openSealed` where the two meet (the hostile-value test), because that is the
  * path that must never leak the value into the log.
+ *
+ * The timer-drained summary and its clear are driven under `FakeTime` (#387):
+ * after #236 they had quietly gone back to being unreached.
  */
 
 import { assertEquals } from '@std/assert'
+import { FakeTime } from '@std/testing/time'
 import { generateAppKey } from '../secret.ts'
 import { RejectionReporter } from '../drivers/cookie.ts'
 import { openSealed, type Rejection } from '../drivers/cookie_seal.ts'
@@ -135,4 +139,78 @@ Deno.test('reporting - subsequent rejections accumulate per class', async () => 
         'bad-prefix': 2,
         'bad-base64': 1,
     })
+})
+
+/**
+ * Capture `console.warn` synchronously, for tests driven by `FakeTime` where the
+ * timer that warns fires inside `tickAsync`.
+ */
+function listenToWarnings(): { lines: string[]; restore: () => void } {
+    const lines: string[] = []
+    const warn = console.warn
+    console.warn = (...a: unknown[]) => void lines.push(a.join(' '))
+    return { lines, restore: () => void (console.warn = warn) }
+}
+
+Deno.test('reporting - a burst followed by silence is summarised when the window closes', async () => {
+    // The shape most worth seeing: a probe that fires a burst and gives up. The
+    // summary is drained by the window's timer, not by the next rejection, so
+    // the silence after the burst must not swallow it.
+    const time = new FakeTime(new Date('2026-03-01T10:00:00Z'))
+    const { lines, restore } = listenToWarnings()
+    try {
+        const reporter = new RejectionReporter()
+        reporter.report('bad-prefix') // warned on its own line, not counted
+        reporter.report('bad-prefix')
+        reporter.report('bad-prefix')
+        reporter.report('tag-mismatch')
+
+        await time.tickAsync(59_999)
+        assertEquals(lines.length, 1, 'no summary before the window closes')
+
+        await time.tickAsync(1)
+        assertEquals(lines.length, 2, 'exactly one summary line')
+        assertEquals(
+            lines[1],
+            '⚠️  3 session cookies rejected in the last 60s — bad-prefix=2 tag-mismatch=1',
+        )
+        assertEquals(
+            reporter.pendingRejections(),
+            {},
+            'the summary clears the window, so no rejection is reported twice',
+        )
+    } finally {
+        restore()
+        time.restore()
+    }
+})
+
+Deno.test('reporting - a rejection after a summary opens a fresh window', async () => {
+    // A sustained campaign must keep producing summaries, one per window,
+    // each counting only its own interval.
+    const time = new FakeTime(new Date('2026-03-01T10:00:00Z'))
+    const { lines, restore } = listenToWarnings()
+    try {
+        const reporter = new RejectionReporter()
+        reporter.report('bad-prefix')
+        reporter.report('bad-prefix')
+        await time.tickAsync(60_000) // first summary: bad-prefix=1
+
+        await time.tickAsync(30_000) // quiet interval, nothing pending
+        assertEquals(lines.length, 2, 'silence produces no empty summary')
+
+        reporter.report('too-long')
+        reporter.report('too-long')
+        await time.tickAsync(60_000)
+
+        assertEquals(lines.length, 3)
+        assertEquals(
+            lines[2],
+            '⚠️  2 session cookies rejected in the last 60s — too-long=2',
+            'the second window counts only its own rejections, from its own start',
+        )
+    } finally {
+        restore()
+        time.restore()
+    }
 })

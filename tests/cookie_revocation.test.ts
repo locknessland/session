@@ -11,9 +11,15 @@
  * @module @lockness/session/tests/cookie_revocation
  */
 
-import { assertEquals, assertRejects } from '@std/assert'
+import {
+    assertEquals,
+    AssertionError,
+    assertRejects,
+    assertThrows,
+} from '@std/assert'
 import { Hono } from 'hono'
 import type { Context } from 'hono'
+import { deleteCookie } from '@lockness/hono'
 import { drainDisposables } from '@lockness/contract/lifecycle/internal'
 import {
     configureSession,
@@ -269,5 +275,71 @@ Deno.test('cookie revocation - destroy() suppresses the trailing re-seal (no log
         reIssued,
         undefined,
         'no fresh session cookie was written after destroy',
+    )
+})
+
+Deno.test('cookie revocation - without absoluteLifetime, destroy fails loud and leaves the cookie in place', async () => {
+    // The core boot gate refuses `revocation` without `absoluteLifetime`; a
+    // caller that bypasses it (a direct `configureSession`) must get an error,
+    // not a revocation entry with a NaN TTL — the store would drop it silently
+    // and the "revoked" cookie would keep authenticating.
+    //
+    // No store write can be observed here: the throw happens while `revoke`'s
+    // own arguments are evaluated, so `revoke` is never entered either way.
+    // What CAN regress is the cookie. A destroy that deleted it before failing
+    // would log the browser out while the session stayed unrevoked — a logout
+    // that looks like it worked, which is the failure fail-loud exists to stop.
+    const store: RevocationStore = {
+        isRevoked: () => Promise.resolve(false),
+        revoke: () => Promise.resolve(),
+        revokeUser: () => Promise.resolve(),
+        userRevokedSince: () => Promise.resolve(null),
+        close: () => Promise.resolve(),
+    }
+    const sealed = await seal(KEY, { user: 'frank' }, 3600, {
+        iat: Math.floor(Date.now() / 1000),
+        jti: 'f'.repeat(32),
+    })
+    const ctx = await contextWith(`rev_session=${encodeURIComponent(sealed)}`)
+    const uncapped: SessionConfig = {
+        ...REV_CONFIG,
+        absoluteLifetime: undefined,
+    }
+    const driver = new CookieSessionDriver(ctx, uncapped, store)
+
+    assertEquals(await driver.read('x'), { user: 'frank' })
+    assertEquals(ctx.res.headers.getSetCookie(), [], 'baseline: no cookie set')
+    await assertRejects(
+        () => driver.destroy('x'),
+        Error,
+        'session revocation requires absoluteLifetime',
+    )
+    assertEquals(
+        ctx.res.headers.getSetCookie(),
+        [],
+        'a destroy that failed to revoke must not delete the cookie either',
+    )
+})
+
+Deno.test('cookie revocation - negative control: the no-cookie assertion fails when a cookie is present', async () => {
+    // #398: the assertion above (`getSetCookie()` is `[]`) previously had no
+    // direct proof that it CAN fail — only the #389 mutation battery showed
+    // that, by reordering `destroy()` so the cookie is deleted before the
+    // revocation throw. This reproduces that same observable state directly
+    // — a Set-Cookie header present — and confirms the identical assertion
+    // shape actually throws on it, instead of passing no matter what.
+    const ctx = await contextWith()
+    deleteCookie(ctx, REV_CONFIG.cookieName, {
+        path: REV_CONFIG.path,
+        domain: REV_CONFIG.domain,
+    })
+    assertThrows(
+        () =>
+            assertEquals(
+                ctx.res.headers.getSetCookie(),
+                [],
+                'a destroy that failed to revoke must not delete the cookie either',
+            ),
+        AssertionError,
     )
 })
